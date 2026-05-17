@@ -1,0 +1,7 @@
+fastmcp
+playwright
+anthropic
+python-dotenv
+pdfplumber
+fpdf2
+python-docx
