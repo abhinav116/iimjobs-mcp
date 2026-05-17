@@ -7,7 +7,7 @@ DB_PATH = Path(__file__).parent / "applications.db"
 
 class ApplicationTracker:
     def __init__(self):
-        self.conn = sqlite3.connect(DB_PATH)
+        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self._init_db()
 
     def _init_db(self):

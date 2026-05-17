@@ -299,6 +299,26 @@ def auto_apply_batch(
 
 
 @mcp.tool()
+def get_applied_jobs_from_iimjobs() -> list[dict]:
+    """
+    Log into IIMJobs and retrieve all jobs you have applied to directly from the website.
+    This includes manually applied jobs, not just ones applied through this MCP.
+
+    Returns:
+        List of applied jobs with title, company, applied_date, status, and url
+    """
+    async def _fetch():
+        b = IIMJobsBrowser()
+        await b.start(headless=True)
+        try:
+            return await b.get_applied_jobs()
+        finally:
+            await b.close()
+
+    return run_async(_fetch())
+
+
+@mcp.tool()
 def get_applications(status_filter: str = "") -> list[dict]:
     """
     View all jobs you have applied to, with status tracking.
