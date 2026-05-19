@@ -208,6 +208,25 @@ Output ONLY the resume text, no commentary."""
         self.save_as_pdf(optimized_text, output_path)
         return output_path
 
+    def extract_companies(self) -> list[str]:
+        """Extract past/current employer names from the resume using Claude."""
+        resume_text = self.read_resume()
+        message = self.client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[{"role": "user", "content": f"""Extract all company/employer names from this resume.
+Return ONLY a JSON array of strings, e.g. ["Company A", "Company B"].
+No explanations, no markdown.
+
+Resume:
+{resume_text}"""}]
+        )
+        import json
+        try:
+            return json.loads(message.content[0].text)
+        except Exception:
+            return []
+
     def get_match_score(self, jd_text: str) -> dict:
         resume_text = self.read_resume()
         prompt = f"""Analyze how well this resume matches the job description.

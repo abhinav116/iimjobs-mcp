@@ -13,6 +13,23 @@ mcp = FastMCP("IIMJobs Auto-Apply")
 optimizer = ResumeOptimizer()
 tracker = ApplicationTracker()
 
+# Extract companies from resume once at startup for blacklist filtering
+_resume_companies: list[str] | None = None
+
+def get_resume_companies() -> list[str]:
+    global _resume_companies
+    if _resume_companies is None:
+        try:
+            _resume_companies = [c.lower() for c in optimizer.extract_companies()]
+        except Exception:
+            _resume_companies = []
+    return _resume_companies
+
+def is_blacklisted_company(company_name: str) -> bool:
+    """Return True if company_name matches any employer in the user's resume."""
+    name = company_name.lower()
+    return any(rc in name or name in rc for rc in get_resume_companies())
+
 
 def run_async(coro):
     """Run async code from sync context."""
@@ -115,7 +132,12 @@ def check_resume_fit(job_url: str) -> dict:
 def apply_to_job(
     job_url: str,
     optimize_resume: bool = True,
-    min_match_score: int = 60
+    min_match_score: int = 60,
+    current_ctc: str = "",
+    expected_ctc: str = "",
+    notice_period: str = "",
+    experience_years: str = "",
+    background_context: str = "",
 ) -> dict:
     """
     Apply to a single job on IIMJOBS, optionally optimizing your resume for the JD.
@@ -124,6 +146,11 @@ def apply_to_job(
         job_url: Full URL of the job listing
         optimize_resume: Whether to tailor the resume to this JD before applying
         min_match_score: Skip application if match score is below this threshold (0-100)
+        current_ctc: Current CTC for screening forms (e.g. "38 LPA")
+        expected_ctc: Expected CTC for screening forms (e.g. "45 LPA")
+        notice_period: Notice period for screening forms (e.g. "2 months")
+        experience_years: Total years of experience for screening forms (e.g. "8")
+        background_context: Brief background for open-ended screening questions
 
     Returns:
         Dict with success status, job details, match_score, resume_version used
@@ -134,10 +161,13 @@ def apply_to_job(
         try:
             await b.login()
             details = await b.get_job_details(job_url)
-            job_id = job_url.rstrip("/").split("/")[-1]
+            job_id = job_url.rstrip("/").split("/")[-1].split("?")[0]
 
             if tracker.already_applied(job_id):
                 return {"success": False, "reason": "Already applied to this job", "job": details}
+
+            if is_blacklisted_company(details.get("company", "")):
+                return {"success": False, "reason": f"Skipped — {details['company']} is a past/current employer", "job": details}
 
             resume_path = None
             resume_version = "original"
@@ -160,9 +190,17 @@ def apply_to_job(
                 )
                 resume_version = f"optimized_{job_id}"
 
-            success = await b.apply_to_job(job_url, resume_path)
+            screening_answers = {
+                "current_ctc": current_ctc,
+                "expected_ctc": expected_ctc,
+                "notice_period": notice_period,
+                "experience_years": experience_years,
+                "background_context": background_context,
+            }
 
-            if success:
+            result = await b.apply_to_job(job_url, resume_path, screening_answers)
+
+            if result["success"]:
                 tracker.add(
                     job_id=job_id,
                     title=details["title"],
@@ -174,7 +212,8 @@ def apply_to_job(
                 )
 
             return {
-                "success": success,
+                "success": result["success"],
+                "reason": result.get("reason", ""),
                 "job": details,
                 "match_score": match_score,
                 "resume_version": resume_version
@@ -194,7 +233,12 @@ def auto_apply_batch(
     min_salary_lpa: int = 0,
     min_match_score: int = 65,
     max_applications: int = 10,
-    optimize_resume: bool = True
+    optimize_resume: bool = True,
+    current_ctc: str = "",
+    expected_ctc: str = "",
+    notice_period: str = "",
+    experience_years: str = "",
+    background_context: str = "",
 ) -> dict:
     """
     Search for jobs matching criteria and automatically apply to all of them.
@@ -234,10 +278,15 @@ def auto_apply_batch(
                 if results["applied_count"] >= max_applications:
                     break
 
-                job_id = job["url"].rstrip("/").split("/")[-1]
+                job_id = job["url"].rstrip("/").split("/")[-1].split("?")[0]
 
                 if tracker.already_applied(job_id):
                     results["skipped"].append({"job": job, "reason": "Already applied"})
+                    results["skipped_count"] += 1
+                    continue
+
+                if is_blacklisted_company(job.get("company", "")):
+                    results["skipped"].append({"job": job, "reason": "Past/current employer"})
                     results["skipped_count"] += 1
                     continue
 
@@ -264,9 +313,17 @@ def auto_apply_batch(
                         )
                         resume_version = f"optimized_{job_id}"
 
-                    success = await b.apply_to_job(job["url"], resume_path)
+                    screening_answers = {
+                        "current_ctc": current_ctc,
+                        "expected_ctc": expected_ctc,
+                        "notice_period": notice_period,
+                        "experience_years": experience_years,
+                        "background_context": background_context,
+                    }
 
-                    if success:
+                    result = await b.apply_to_job(job["url"], resume_path, screening_answers)
+
+                    if result["success"]:
                         tracker.add(
                             job_id=job_id,
                             title=job["title"],
@@ -283,7 +340,7 @@ def auto_apply_batch(
                         })
                         results["applied_count"] += 1
                     else:
-                        results["failed"].append({"job": job, "reason": "Application submission failed"})
+                        results["failed"].append({"job": job, "reason": result.get("reason", "Unknown")})
                         results["failed_count"] += 1
 
                 except Exception as e:

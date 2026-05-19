@@ -29,6 +29,14 @@ class IIMJobsBrowser:
         if hasattr(self, "_playwright"):
             await self._playwright.stop()
 
+    async def ensure_logged_in(self) -> bool:
+        """Verify session is active; re-login if expired. Returns True if logged in."""
+        await self._page.goto(f"{self.BASE_URL}/jobfeed")
+        await self._page.wait_for_load_state("load")
+        if "login" in self._page.url:
+            return await self.login()
+        return True
+
     async def login(self) -> bool:
         page = self._page
         await page.goto(f"{self.BASE_URL}/login")
@@ -221,31 +229,178 @@ class IIMJobsBrowser:
 
         return jobs
 
-    async def apply_to_job(self, job_url: str, resume_path: Path | None = None) -> bool:
+    async def _fill_screening_form(self, answers: dict) -> None:
+        """
+        Fill all visible screening form fields using label/placeholder matching.
+        Handles text inputs, number inputs, selects, radios, and textareas.
+        Loops through multiple pages (Next) until Submit or no more navigation.
+        """
         page = self._page
+
+        field_map = [
+            (["current ctc", "current salary", "present ctc", "current compensation"], answers.get("current_ctc", "")),
+            (["expected ctc", "expected salary", "desired ctc", "expected compensation"], answers.get("expected_ctc", "")),
+            (["notice period", "notice"], answers.get("notice_period", "")),
+            (["total experience", "years of experience", "work experience"], answers.get("experience_years", "")),
+        ]
+
+        for _ in range(5):  # up to 5 form pages
+            await page.wait_for_timeout(1000)
+
+            # --- Text / Number inputs ---
+            for input_el in await page.locator("input[type='text'], input[type='number'], input:not([type])").all():
+                try:
+                    input_id = await input_el.get_attribute("id") or ""
+                    placeholder = (await input_el.get_attribute("placeholder") or "").lower()
+                    label_text = ""
+                    if input_id:
+                        lbl = page.locator(f"label[for='{input_id}']")
+                        if await lbl.count():
+                            label_text = (await lbl.inner_text()).lower()
+                    combined = label_text + " " + placeholder
+                    for keywords, value in field_map:
+                        if value and any(kw in combined for kw in keywords):
+                            await input_el.clear()
+                            await input_el.fill(str(value))
+                            break
+                except Exception:
+                    continue
+
+            # --- Select dropdowns ---
+            for select_el in await page.locator("select").all():
+                try:
+                    select_id = await select_el.get_attribute("id") or ""
+                    label_text = ""
+                    if select_id:
+                        lbl = page.locator(f"label[for='{select_id}']")
+                        if await lbl.count():
+                            label_text = (await lbl.inner_text()).lower()
+
+                    if "notice" in label_text:
+                        notice = answers.get("notice_period", "").lower()
+                        for opt in await select_el.locator("option").all():
+                            opt_text = (await opt.inner_text()).lower()
+                            if notice in opt_text or "2 month" in opt_text or "60 day" in opt_text:
+                                await select_el.select_option(value=await opt.get_attribute("value"))
+                                break
+                    elif "relocat" in label_text:
+                        try:
+                            await select_el.select_option(label="Yes")
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+
+            # --- Radio buttons (relocation yes/no) ---
+            for label_el in await page.locator("label").all():
+                try:
+                    label_text = (await label_el.inner_text()).lower()
+                    if "relocat" in label_text:
+                        yes_radio = page.locator("input[type='radio'][value='yes'], input[type='radio'][value='Yes'], input[type='radio'][value='1']").first
+                        if await yes_radio.count():
+                            await yes_radio.click()
+                        break
+                except Exception:
+                    continue
+
+            # --- Textareas (open-ended questions) ---
+            for textarea in await page.locator("textarea").all():
+                try:
+                    if not await textarea.input_value():
+                        background = answers.get("background_context", "product management")
+                        await textarea.fill(
+                            f"I have strong experience in {background}. "
+                            "I am excited about this opportunity and confident I can drive measurable impact in this role."
+                        )
+                except Exception:
+                    continue
+
+            # --- Navigate: Next or Submit ---
+            next_btn = page.locator("button:has-text('Next'), button:has-text('Continue'), button:has-text('Proceed')").first
+            submit_btn = page.locator("button:has-text('Submit'), button[type='submit']").first
+
+            if await next_btn.count():
+                await next_btn.click()
+                await page.wait_for_timeout(1500)
+            elif await submit_btn.count():
+                await submit_btn.click()
+                await page.wait_for_load_state("load")
+                break
+            else:
+                break
+
+    async def apply_to_job(
+        self,
+        job_url: str,
+        resume_path: Path | None = None,
+        screening_answers: dict | None = None,
+    ) -> dict:
+        """
+        Apply to a job. Returns dict with keys: success (bool), reason (str).
+        Handles session expiry, screening forms, and external ATS detection.
+        """
+        page = self._page
+        answers = screening_answers or {}
+
+        # Ensure session is still alive before applying
+        if not await self.ensure_logged_in():
+            return {"success": False, "reason": "Login failed — session could not be restored"}
+
         await page.goto(job_url)
         await page.wait_for_load_state("load")
+        await page.wait_for_timeout(1500)
 
-        # Upload optimized resume before applying if provided
+        # Detect external ATS redirect (Workday, Greenhouse, Lever, etc.)
+        if self.BASE_URL not in page.url:
+            return {"success": False, "reason": f"External ATS detected: {page.url} — skipped"}
+
+        # Upload optimized resume before applying if provided, then return to job page
         if resume_path:
             await self.upload_resume(resume_path)
+            await page.wait_for_timeout(2000)  # wait for upload to persist
             await page.goto(job_url)
             await page.wait_for_load_state("load")
 
-        # Click apply button
-        apply_btn = page.locator('button:has-text("Apply"), a:has-text("Apply Now"), .apply-btn').first
+        # Detect if already applied
+        already = page.locator(":has-text('Already Applied'), :has-text('Application Sent'), .applied-badge")
+        if await already.count():
+            return {"success": False, "reason": "Already applied (detected on page)"}
+
+        # Click Apply
+        apply_btn = page.locator("button:has-text('Apply'), a:has-text('Apply Now'), .apply-btn").first
         if not await apply_btn.count():
-            return False
+            return {"success": False, "reason": "Apply button not found — job may be closed"}
 
         await apply_btn.click()
-        await page.wait_for_load_state("load")
+        await page.wait_for_timeout(2000)
 
-        # Handle confirmation modal if present
-        confirm_btn = page.locator('button:has-text("Confirm"), button:has-text("Submit"), .confirm-apply')
-        if await confirm_btn.count():
-            await confirm_btn.first.click()
-            await page.wait_for_load_state("load")
+        # Fill screening form if one appeared
+        screening_indicators = ["current ctc", "expected ctc", "notice period", "experience", "questionnaire"]
+        page_text = (await page.locator("body").inner_text()).lower()
+        if any(kw in page_text for kw in screening_indicators):
+            await self._fill_screening_form(answers)
+        else:
+            # Simple confirm modal
+            confirm_btn = page.locator("button:has-text('Confirm'), button:has-text('Submit'), .confirm-apply").first
+            if await confirm_btn.count():
+                await confirm_btn.click()
+                await page.wait_for_load_state("load")
 
-        # Verify success
-        success_el = page.locator(':has-text("successfully applied"), :has-text("Application submitted"), .success-message')
-        return await success_el.count() > 0
+        # Verify success — check for success signals or absence of Apply button
+        await page.wait_for_timeout(1500)
+        success_signals = [
+            ":has-text('successfully applied')",
+            ":has-text('Application submitted')",
+            ":has-text('Applied Successfully')",
+            ":has-text('Thank you for applying')",
+            ".success-message",
+        ]
+        for sig in success_signals:
+            if await page.locator(sig).count():
+                return {"success": True, "reason": ""}
+
+        # Fallback: if Apply button is gone, treat as success
+        if not await page.locator("button:has-text('Apply'), a:has-text('Apply Now')").count():
+            return {"success": True, "reason": "Apply button disappeared — assumed success"}
+
+        return {"success": False, "reason": "Could not confirm application submission"}
