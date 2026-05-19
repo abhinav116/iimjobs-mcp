@@ -45,10 +45,13 @@ Claude reads this, resolves the right IIMjobs category page from `iimjobs_catego
 ### How it works
 
 1. Every hour, Claude navigates to your role's dedicated IIMjobs category page (e.g. `/k/strategy-consulting-jobs`) instead of the generic feed — pre-filtered, no keyword matching needed
-2. Filters for jobs posted in the last hour only
+2. Filters for jobs posted in the last hour only; skips course/ad listings
 3. Cross-checks against your local applications log to skip duplicates
-4. Applies via Playwright, fills screening forms with your CTC/notice period
-5. Logs everything locally
+4. Skips jobs at companies already on your resume (past/current employers)
+5. Detects and skips jobs that redirect to an external ATS (Workday, Greenhouse, Lever)
+6. Applies via Playwright, automatically fills screening forms — CTC, expected CTC, notice period, experience, relocation, and open-ended text questions; handles multi-page forms
+7. Recovers from session expiry automatically before each application
+8. Logs everything locally with the skip/fail reason for every job
 
 ### Role → URL resolution
 
@@ -84,11 +87,15 @@ All available category URLs are in [`iimjobs_category_urls.md`](./iimjobs_catego
 
 **How auto-apply works:**
 1. Searches IIMJobs for your target role
-2. Scores your resume against each JD using Claude
-3. Skips jobs below your match threshold (default: 65/100)
-4. Rewrites your resume to mirror the JD's keywords (without fabricating anything)
-5. Uploads the tailored resume to your IIMJobs profile
-6. Clicks apply and logs everything to a local SQLite database
+2. Skips jobs at companies already on your resume (past/current employers — extracted automatically via Claude)
+3. Scores your resume against each JD using Claude Haiku
+4. Skips jobs below your match threshold (default: 65/100)
+5. Rewrites your resume to mirror the JD's keywords using Claude Sonnet (without fabricating anything)
+6. Uploads the tailored resume to your IIMJobs profile, waits for upload to persist
+7. Detects and skips external ATS redirects (Workday, Greenhouse, Lever, etc.)
+8. Detects and fills screening forms automatically — CTC fields, notice period dropdowns, relocation radios, open-ended textareas; handles multi-page forms
+9. Verifies success via on-page signals with a fallback heuristic (Apply button disappearance)
+10. Logs everything to a local SQLite database with skip/fail reasons
 
 ### Setup
 
@@ -128,11 +135,24 @@ Restart Claude Code. The tools will now be available in any conversation.
 
 > *"Mark job 12345 as interviewing — got a call from Razorpay"*
 
+### Screening form parameters
+
+Both `apply_to_job` and `auto_apply_batch` accept these for filling screening forms automatically:
+
+| Parameter | Example | Used for |
+|---|---|---|
+| `current_ctc` | `"38 LPA"` | Current salary field |
+| `expected_ctc` | `"45 LPA"` | Expected salary field |
+| `notice_period` | `"2 months"` | Notice period field/dropdown |
+| `experience_years` | `"8"` | Total experience field |
+| `background_context` | `"SaaS product management"` | Open-ended text questions |
+
 ### Configuration tips
 
 - **`min_match_score`** (default 65) — raise this to be more selective, lower it to cast a wider net
 - **`max_applications`** — cap how many jobs it applies to in one run
 - **`optimize_resume`** — set to `False` to apply with your original resume (faster, less API cost)
+- **Employer blacklist** — automatically extracted from your resume at startup; no config needed
 
 ---
 
@@ -145,10 +165,13 @@ Restart Claude Code. The tools will now be available in any conversation.
 
 ## Notes
 
-- All application data is stored locally — never shared anywhere
+- All application data is stored locally in `applications.db` — never shared anywhere
 - The browser runs headless by default. Change `headless=True` to `headless=False` in `browser.py` if you want to watch it work
-- Resume optimization (Option 2) uses Claude Sonnet (~$0.01–0.03 per resume). Match scoring uses Claude Haiku (much cheaper)
+- Resume optimization uses Claude Sonnet (~$0.01–0.03 per resume). Match scoring and company extraction use Claude Haiku (much cheaper)
 - Option 1 (Claude Code native) has zero additional API cost beyond your normal Claude Code usage
+- Session expiry is handled automatically — Claude re-logs in before each application if the session has expired
+- Jobs at past/current employers (extracted from your resume) are silently skipped with reason logged
+- External ATS redirects (Workday, Greenhouse, Lever) are detected and skipped gracefully
 
 ## Security
 
