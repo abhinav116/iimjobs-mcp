@@ -16,3 +16,6 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# User-specific config (copy from config.example.json and fill in your details)
+config.json

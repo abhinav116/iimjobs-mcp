@@ -1,0 +1,22 @@
+{
+  "screening_answers": {
+    "current_ctc": "XX LPA",
+    "expected_ctc": "XX LPA",
+    "notice_period": "1 month",
+    "location_comfort": "Yes"
+  },
+  "job_preferences": {
+    "relevant_domains": [
+      "B2B SaaS",
+      "AI/ML",
+      "Fintech",
+      "BFSI",
+      "Payments",
+      "Telecom",
+      "Fraud Prevention",
+      "IT Product Management"
+    ],
+    "roles": ["Product Manager", "Senior Product Manager"],
+    "exclude_roles": ["Data Scientist", "Data Analyst", "Project Manager"]
+  }
+}
