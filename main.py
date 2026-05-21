@@ -105,6 +105,48 @@ def get_job_details(job_url: str) -> dict:
 
 
 @mcp.tool()
+def get_resume_context(job_url: str = "") -> dict:
+    """
+    Get the current resume text and the optimization instructions.
+    Useful for when the client agent needs to perform optimization itself.
+
+    Args:
+        job_url: Optional URL of a job to get specific optimization prompt for.
+
+    Returns:
+        Dict with resume_text and optimization_prompt
+    """
+    try:
+        resume_text = optimizer.read_resume()
+    except FileNotFoundError as e:
+        return {"success": False, "error": str(e)}
+
+    prompt = ""
+    if job_url:
+        async def _get_prompt():
+            b = IIMJobsBrowser()
+            await b.start(headless=True)
+            try:
+                await b.login()
+                details = await b.get_job_details(job_url)
+                return optimizer.get_optimization_prompt(
+                    details["jd_text"], details["title"], details["company"]
+                )
+            finally:
+                await b.close()
+        prompt = run_async(_get_prompt())
+    else:
+        # Generic prompt template
+        prompt = optimizer.get_optimization_prompt("[JD TEXT]", "[JOB TITLE]", "[COMPANY]")
+
+    return {
+        "resume_text": resume_text,
+        "optimization_prompt": prompt,
+        "internal_optimizer_available": bool(optimizer.client)
+    }
+
+
+@mcp.tool()
 def check_resume_fit(job_url: str) -> dict:
     """
     Analyze how well your resume matches a specific job before applying.
@@ -121,7 +163,19 @@ def check_resume_fit(job_url: str) -> dict:
         try:
             await b.login()
             details = await b.get_job_details(job_url)
-            return optimizer.get_match_score(details["jd_text"])
+            result = optimizer.get_match_score(details["jd_text"])
+
+            if not optimizer.client:
+                # Add instructions for delegation if internal scoring is fallback
+                result["action_required"] = "Internal scoring is using fallback. For better accuracy, please analyze the JD and Resume yourself."
+                result["jd_text"] = details["jd_text"]
+                try:
+                    result["resume_text"] = optimizer.read_resume()
+                except FileNotFoundError as e:
+                    return {"success": False, "error": str(e)}
+
+            return result
+
         finally:
             await b.close()
 
@@ -132,6 +186,7 @@ def check_resume_fit(job_url: str) -> dict:
 def apply_to_job(
     job_url: str,
     optimize_resume: bool = True,
+    provided_resume_text: str = "",
     min_match_score: int = 60,
     current_ctc: str = "",
     expected_ctc: str = "",
@@ -145,6 +200,7 @@ def apply_to_job(
     Args:
         job_url: Full URL of the job listing
         optimize_resume: Whether to tailor the resume to this JD before applying
+        provided_resume_text: Optimized resume text provided by the client (skips internal LLM)
         min_match_score: Skip application if match score is below this threshold (0-100)
         current_ctc: Current CTC for screening forms (e.g. "38 LPA")
         expected_ctc: Expected CTC for screening forms (e.g. "45 LPA")
@@ -153,7 +209,8 @@ def apply_to_job(
         background_context: Brief background for open-ended screening questions
 
     Returns:
-        Dict with success status, job details, match_score, resume_version used
+        Dict with success status, job details, match_score, resume_version used.
+        If internal optimizer is missing and no text is provided, returns delegation instructions.
     """
     async def _apply():
         b = IIMJobsBrowser()
@@ -169,11 +226,48 @@ def apply_to_job(
             if is_blacklisted_company(details.get("company", "")):
                 return {"success": False, "reason": f"Skipped — {details['company']} is a past/current employer", "job": details}
 
+            # FALLBACK LOGIC: No internal optimizer and no provided text
+            if optimize_resume and not provided_resume_text and not optimizer.client:
+                try:
+                    resume_text = optimizer.read_resume()
+                    opt_prompt = optimizer.get_optimization_prompt(
+                        details["jd_text"], details["title"], details["company"]
+                    )
+                except FileNotFoundError as e:
+                    return {"success": False, "error": str(e)}
+
+                return {
+                    "success": False,
+                    "reason": "Internal optimizer unavailable (No API key).",
+                    "action_required": "Please optimize the resume text yourself using the provided prompt and resume context. Then call 'apply_to_job' again with 'provided_resume_text'.",
+                    "optimization_prompt": opt_prompt,
+                    "resume_text": resume_text,
+                    "job_details": details
+                }
+
+            # Cleanup provided text (strip markdown if agent included it)
+            if provided_resume_text:
+                provided_resume_text = provided_resume_text.strip()
+                if provided_resume_text.startswith("```"):
+                    # Remove ```text ... ``` or just ``` ... ```
+                    lines = provided_resume_text.split("\n")
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines[-1].strip() == "```":
+                        lines = lines[:-1]
+                    provided_resume_text = "\n".join(lines).strip()
+
             resume_path = None
             resume_version = "original"
             match_score = 100
 
-            if optimize_resume:
+            if provided_resume_text:
+                resume_path = optimizer.get_optimized_resume_path(
+                    job_id, details["jd_text"], details["title"], details["company"],
+                    provided_text=provided_resume_text
+                )
+                resume_version = f"delegated_{job_id}"
+            elif optimize_resume:
                 score_data = optimizer.get_match_score(details["jd_text"])
                 match_score = score_data.get("score", 0)
 
@@ -255,12 +349,44 @@ def auto_apply_batch(
         optimize_resume: Whether to tailor resume for each JD
 
     Returns:
-        Summary with applied_count, skipped_count, failed_count, and details per job
+        Summary with applied_count, skipped_count, failed_count, and details per job.
+        If internal optimizer is missing, returns list of jobs for client to process individually.
     """
     async def _batch():
         b = IIMJobsBrowser()
         await b.start(headless=True)
 
+        # FALLBACK LOGIC: Batch optimization requested but no internal optimizer
+        if optimize_resume and not optimizer.client:
+            try:
+                await b.login()
+                jobs = await b.search_jobs(role, location, min_experience, max_experience, min_salary_lpa)
+                filtered_jobs = []
+                for job in jobs:
+                    job_id = job["url"].rstrip("/").split("/")[-1].split("?")[0]
+                    if not tracker.already_applied(job_id) and not is_blacklisted_company(job.get("company", "")):
+                        filtered_jobs.append(job)
+                    if len(filtered_jobs) >= max_applications:
+                        break
+
+                try:
+                    resume_text = optimizer.read_resume()
+                    opt_instructions = optimizer.get_optimization_prompt("[JD]", "[TITLE]", "[COMPANY]")
+                except FileNotFoundError as e:
+                    return {"success": False, "error": str(e)}
+
+                return {
+                    "success": False,
+                    "reason": "Internal optimizer unavailable for batch processing.",
+                    "action_required": "Please iterate through these jobs and call 'apply_to_job' for each, providing optimized text from your own intelligence.",
+                    "jobs_to_process": filtered_jobs,
+                    "resume_text": resume_text,
+                    "optimization_instructions": opt_instructions
+                }
+            finally:
+                await b.close()
+
+        # Original batch logic continues only if internal optimizer is available
         results = {
             "applied": [],
             "skipped": [],

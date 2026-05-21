@@ -8,7 +8,12 @@ from fpdf import FPDF
 
 class ResumeOptimizer:
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        self.api_key = os.environ.get("ANTHROPIC_API_KEY")
+        try:
+            self.client = anthropic.Anthropic(api_key=self.api_key) if self.api_key else None
+        except Exception:
+            self.client = None
+
         resume_env = os.environ.get("RESUME_PATH", "")
         self.resume_path = Path(resume_env) if resume_env else Path(__file__).parent / "resume.pdf"
         self._resume_text: str | None = None
@@ -16,6 +21,9 @@ class ResumeOptimizer:
     def read_resume(self) -> str:
         if self._resume_text:
             return self._resume_text
+        if not self.resume_path.exists():
+            raise FileNotFoundError(f"Resume not found at {self.resume_path}. Please set RESUME_PATH in .env or upload resume.pdf")
+
         suffix = self.resume_path.suffix.lower()
         if suffix == ".pdf":
             with pdfplumber.open(self.resume_path) as pdf:
@@ -30,9 +38,9 @@ class ResumeOptimizer:
             raise ValueError(f"Unsupported resume format: {suffix}")
         return self._resume_text
 
-    def optimize(self, jd_text: str, job_title: str, company: str) -> str:
+    def get_optimization_prompt(self, jd_text: str, job_title: str, company: str) -> str:
         resume_text = self.read_resume()
-        prompt = f"""You are an expert resume writer and ATS optimization specialist.
+        return f"""You are an expert resume writer and ATS optimization specialist.
 
 I am applying for the role of **{job_title}** at **{company}**.
 
@@ -78,6 +86,11 @@ Tech Stack: ...
 
 Output ONLY the resume text, no commentary."""
 
+    def optimize(self, jd_text: str, job_title: str, company: str) -> str:
+        if not self.client:
+            raise ValueError("ANTHROPIC_API_KEY not configured. Cannot optimize internally.")
+
+        prompt = self.get_optimization_prompt(jd_text, job_title, company)
         message = self.client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
@@ -196,40 +209,59 @@ Output ONLY the resume text, no commentary."""
         return output_path
 
     def get_optimized_resume_path(self, job_id: str, jd_text: str,
-                                   job_title: str, company: str) -> Path:
+                                   job_title: str, company: str, provided_text: str = "") -> Path:
         output_dir = Path(__file__).parent / "optimized_resumes"
         output_dir.mkdir(exist_ok=True)
-        output_path = output_dir / f"resume_{job_id}.pdf"
+        prefix = "delegated" if provided_text else "resume"
+        output_path = output_dir / f"{prefix}_{job_id}.pdf"
 
         if output_path.exists():
             return output_path  # already generated for this job
 
-        optimized_text = self.optimize(jd_text, job_title, company)
+        if provided_text:
+            optimized_text = provided_text
+        else:
+            optimized_text = self.optimize(jd_text, job_title, company)
+
         self.save_as_pdf(optimized_text, output_path)
         return output_path
 
     def extract_companies(self) -> list[str]:
         """Extract past/current employer names from the resume using Claude."""
-        resume_text = self.read_resume()
-        message = self.client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=256,
-            messages=[{"role": "user", "content": f"""Extract all company/employer names from this resume.
+        if not self.client:
+            # Fallback: cannot extract without LLM, return empty list
+            return []
+
+        try:
+            resume_text = self.read_resume()
+            message = self.client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=256,
+                messages=[{"role": "user", "content": f"""Extract all company/employer names from this resume.
 Return ONLY a JSON array of strings, e.g. ["Company A", "Company B"].
 No explanations, no markdown.
 
 Resume:
 {resume_text}"""}]
-        )
-        import json
-        try:
+            )
+            import json
             return json.loads(message.content[0].text)
         except Exception:
             return []
 
     def get_match_score(self, jd_text: str) -> dict:
-        resume_text = self.read_resume()
-        prompt = f"""Analyze how well this resume matches the job description.
+        if not self.client:
+            # Fallback: cannot score without LLM, return a neutral score
+            return {
+                "score": 100,
+                "matching_skills": [],
+                "missing_skills": [],
+                "recommendation": "Internal scoring unavailable (No API key). Proceeding with application."
+            }
+
+        try:
+            resume_text = self.read_resume()
+            prompt = f"""Analyze how well this resume matches the job description.
 
 JD:
 <jd>{jd_text}</jd>
@@ -245,10 +277,12 @@ Return a JSON object with:
 
 Return ONLY valid JSON, no markdown."""
 
-        message = self.client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        import json
-        return json.loads(message.content[0].text)
+            message = self.client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            import json
+            return json.loads(message.content[0].text)
+        except Exception:
+            return {"score": 100, "recommendation": "Error during internal scoring."}
